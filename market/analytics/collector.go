@@ -299,6 +299,8 @@ type Collector struct {
 	flushInterval time.Duration
 	maxBacklog    int
 	stopCh        chan struct{}
+	running       bool
+	stopping      bool
 	flushed       int64
 	errors        int64
 	dropped       int64
@@ -455,14 +457,31 @@ func (c *Collector) RecordHistogram(name string, value float64, tags ...MetricTa
 	})
 }
 
-// Start begins the background flush loop. It spawns a goroutine that
-// periodically flushes collected metrics to the backend. The flush
-// loop will stop when the context is cancelled or Stop() is called.
-// NOTE: Calling Start() multiple times will spawn multiple flush
-// goroutines, causing duplicate flushes. This is a known issue.
-// TODO: Make Start() idempotent.
+// Start begins the background flush loop. It is idempotent: repeated or
+// concurrent calls while a flush loop is already active do not create
+// duplicate goroutines. The flush loop will stop when the context is
+// cancelled or Stop() is called.
 func (c *Collector) Start(ctx context.Context) {
+	c.mu.Lock()
+	if c.running || c.stopping {
+		c.mu.Unlock()
+		return
+	}
+	stopCh := make(chan struct{})
+	c.stopCh = stopCh
+	c.running = true
+	c.mu.Unlock()
+
 	go func() {
+		defer func() {
+			c.mu.Lock()
+			if c.stopCh == stopCh {
+				c.running = false
+				c.stopping = false
+			}
+			c.mu.Unlock()
+		}()
+
 		// Tick immediately to flush any bootstrapped metrics
 		c.flush(ctx)
 		ticker := time.NewTicker(c.flushInterval)
@@ -473,7 +492,7 @@ func (c *Collector) Start(ctx context.Context) {
 				// Final flush before exiting
 				c.flush(context.Background())
 				return
-			case <-c.stopCh:
+			case <-stopCh:
 				return
 			case <-ticker.C:
 				c.flush(ctx)
@@ -486,10 +505,16 @@ func (c *Collector) Start(ctx context.Context) {
 // If you want a final flush, call Flush() before Stop().
 // TODO: Add a Drain() method that performs a final flush and then stops.
 func (c *Collector) Stop() {
-	select {
-	case c.stopCh <- struct{}{}:
-	default:
+	c.mu.Lock()
+	if !c.running || c.stopping {
+		c.mu.Unlock()
+		return
 	}
+	stopCh := c.stopCh
+	c.stopping = true
+	c.mu.Unlock()
+
+	close(stopCh)
 }
 
 // Flush immediately flushes all buffered metrics to the backend.

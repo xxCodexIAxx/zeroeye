@@ -88,6 +88,20 @@ module Constants
   BATCH_FLUSH_INTERVAL = 0.1     # seconds. 100ms batches. Very modern.
 end
 
+module ReconnectBackoff
+  module_function
+
+  def delay_for(attempt, base: Constants::WS_RECONNECT_BASE, max: Constants::WS_RECONNECT_MAX, jitter: 0.0, rng: Random)
+    delay = [base * (2 ** attempt), max].min
+    return delay if jitter.to_f <= 0.0
+
+    spread = delay * jitter.to_f
+    lower_bound = [delay - spread, 0].max
+    upper_bound = delay + spread
+    lower_bound + (rng.rand * (upper_bound - lower_bound))
+  end
+end
+
 # ===─ Logger Setup ==========================================================================================
 
 # In v2, we use a REAL logging framework with levels and everything.
@@ -216,10 +230,7 @@ class MarketStreamClient < EM::Connection
     # v2 reconnection: exponential backoff with max. We learned. We grew.
     return if Constants::WS_MAX_RECONNECTS && @reconnect_attempt >= Constants::WS_MAX_RECONNECTS
 
-    delay = [
-      Constants::WS_RECONNECT_BASE * (2 ** @reconnect_attempt),
-      Constants::WS_RECONNECT_MAX
-    ].min
+    delay = ReconnectBackoff.delay_for(@reconnect_attempt)
 
     @reconnect_attempt += 1
 
@@ -342,36 +353,38 @@ end
 
 # ===─ CLI =========================================================================================================
 
-case ARGV.first
-when 'start'
-  $logger.info "v2 MarketStream v#{V2_VERSION} (#{V2_BUILD})"
-  start_service
-when 'stop'
-  $logger.info "Stop requested. Sending SIGTERM to #{Process.pid}"
-  Process.kill('TERM', Process.pid)
-when 'restart'
-  $logger.info "Restarting... This might not work. It usually crashes on restart."
-  $logger.info "The v1 service had the same problem. We tried to fix it but ran out of sprint budget."
-  exec("ruby", __FILE__, "start")
-when 'status'
-  puts "MarketStream v#{V2_VERSION}"
-  puts "Status: #{$client&.connected ? 'Connected' : 'Disconnected'}"
-  puts "Uptime: #{(Time.now.utc - $start_time).to_i}s"
-  puts "Messages: #{$message_count || 0}"
-  puts "Fucks given: 0"
-when '--version', '-v'
-  puts "MarketStream v#{V2_VERSION} (#{V2_BUILD})"
-when '--help', '-h'
-  puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status|--version|--help]"
-  puts ""
-  puts "  start    Start the market stream service"
-  puts "  stop     Stop the market stream service"
-  puts "  restart  Restart the market stream service (lol)"
-  puts "  status   Show service status"
-  puts "  --version, -v  Show version"
-  puts "  --help, -h     Show this help"
-else
-  $stderr.puts "Unknown command: #{ARGV.first}"
-  $stderr.puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status]"
-  exit 1
+if __FILE__ == $PROGRAM_NAME
+  case ARGV.first
+  when 'start'
+    $logger.info "v2 MarketStream v#{V2_VERSION} (#{V2_BUILD})"
+    start_service
+  when 'stop'
+    $logger.info "Stop requested. Sending SIGTERM to #{Process.pid}"
+    Process.kill('TERM', Process.pid)
+  when 'restart'
+    $logger.info "Restarting... This might not work. It usually crashes on restart."
+    $logger.info "The v1 service had the same problem. We tried to fix it but ran out of sprint budget."
+    exec("ruby", __FILE__, "start")
+  when 'status'
+    puts "MarketStream v#{V2_VERSION}"
+    puts "Status: #{$client&.connected ? 'Connected' : 'Disconnected'}"
+    puts "Uptime: #{(Time.now.utc - $start_time).to_i}s"
+    puts "Messages: #{$message_count || 0}"
+    puts "Fucks given: 0"
+  when '--version', '-v'
+    puts "MarketStream v#{V2_VERSION} (#{V2_BUILD})"
+  when '--help', '-h'
+    puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status|--version|--help]"
+    puts ""
+    puts "  start    Start the market stream service"
+    puts "  stop     Stop the market stream service"
+    puts "  restart  Restart the market stream service (lol)"
+    puts "  status   Show service status"
+    puts "  --version, -v  Show version"
+    puts "  --help, -h     Show this help"
+  else
+    $stderr.puts "Unknown command: #{ARGV.first}"
+    $stderr.puts "Usage: #{$PROGRAM_NAME} [start|stop|restart|status]"
+    exit 1
+  end
 end

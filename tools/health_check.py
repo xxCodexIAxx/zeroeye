@@ -39,7 +39,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -63,6 +63,81 @@ DISK_THRESHOLD_CRITICAL = 90
 
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
+
+
+class TokenBucketRateLimiter:
+    """Token bucket limiter for spacing outbound probes."""
+
+    def __init__(
+        self,
+        rate_per_second: float,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ):
+        self.configured_rate = max(0.0, float(rate_per_second))
+        self.clock = clock
+        self.sleeper = sleeper
+        self.tokens = self.configured_rate
+        self.last_refill = self.clock()
+        self.throttled_requests = 0
+        self.total_wait_seconds = 0.0
+        self.last_effective_rate = self.configured_rate
+
+    def _refill(self, effective_rate: float) -> None:
+        now = self.clock()
+        elapsed = max(0.0, now - self.last_refill)
+        self.tokens = min(effective_rate, self.tokens + elapsed * effective_rate)
+        self.last_refill = now
+
+    def wait_for_token(self, half_open: bool = False) -> None:
+        if self.configured_rate <= 0:
+            self.last_effective_rate = 0.0
+            return
+
+        effective_rate = self.configured_rate * (0.5 if half_open else 1.0)
+        effective_rate = max(0.1, effective_rate)
+        self.last_effective_rate = effective_rate
+        self._refill(effective_rate)
+
+        if self.tokens < 1.0:
+            wait_seconds = (1.0 - self.tokens) / effective_rate
+            self.throttled_requests += 1
+            self.total_wait_seconds += wait_seconds
+            self.sleeper(wait_seconds)
+            self._refill(effective_rate)
+
+        self.tokens = max(0.0, self.tokens - 1.0)
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "configured_rate": self.configured_rate,
+            "current_rate": self.last_effective_rate,
+            "throttled_requests": self.throttled_requests,
+            "total_wait_seconds": round(self.total_wait_seconds, 3),
+            "tokens_available": round(self.tokens, 3),
+        }
+
+
+def parse_timeout_overrides(timeout_arg: Optional[str]) -> Tuple[Optional[float], Dict[str, float]]:
+    if not timeout_arg:
+        return None, {}
+
+    if "=" not in timeout_arg:
+        return float(timeout_arg), {}
+
+    overrides: Dict[str, float] = {}
+    for item in timeout_arg.split(","):
+        name, value = item.split("=", 1)
+        overrides[name.strip()] = float(value)
+    return None, overrides
+
+
+def resolve_timeout(name: str, config: Dict[str, Any], default_timeout: Optional[float], overrides: Dict[str, float]) -> float:
+    if name in overrides:
+        return overrides[name]
+    if default_timeout is not None:
+        return default_timeout
+    return float(config["timeout"])
 
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
@@ -200,13 +275,24 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(
+    service: Optional[str] = None,
+    json_output: bool = False,
+    timeout_arg: Optional[str] = None,
+    probe_rate: float = 0.0,
+    circuit_states: Optional[Dict[str, str]] = None,
+    rate_limiter: Optional[TokenBucketRateLimiter] = None,
+) -> Dict[str, Any]:
+    default_timeout, timeout_overrides = parse_timeout_overrides(timeout_arg)
+    limiter = rate_limiter if rate_limiter is not None else TokenBucketRateLimiter(probe_rate)
+    circuit_states = circuit_states or {}
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
         "services": {},
         "infrastructure": {},
         "system": {},
+        "rate_limiter": {},
         "overall_status": "OK",
     }
 
@@ -216,14 +302,19 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in SERVICES.items():
         if service and name != service:
             continue
+        circuit_state = circuit_states.get(name, config.get("circuit_state", "CLOSED"))
+        limiter.wait_for_token(half_open=circuit_state.upper() == "HALF_OPEN")
+        timeout = resolve_timeout(name, config, default_timeout, timeout_overrides)
         status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+            config["host"], config["port"], config["path"], timeout
         )
         results["services"][name] = {
             "status": status,
             "detail": detail,
             "code": code,
             "endpoint": f"http://{config['host']}:{config['port']}{config['path']}",
+            "timeout": timeout,
+            "circuit_state": circuit_state,
         }
         if status == "CRITICAL":
             all_ok = False
@@ -232,11 +323,16 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
     for name, config in INFRASTRUCTURE.items():
         if service and name != service:
             continue
-        status, detail, latency = check_tcp_port(config["host"], config["port"], config["timeout"])
+        circuit_state = circuit_states.get(name, config.get("circuit_state", "CLOSED"))
+        limiter.wait_for_token(half_open=circuit_state.upper() == "HALF_OPEN")
+        timeout = resolve_timeout(name, config, default_timeout, timeout_overrides)
+        status, detail, latency = check_tcp_port(config["host"], config["port"], timeout)
         results["infrastructure"][name] = {
             "status": status,
             "detail": detail,
             "endpoint": f"{config['host']}:{config['port']}",
+            "timeout": timeout,
+            "circuit_state": circuit_state,
         }
         if status == "CRITICAL":
             all_ok = False
@@ -260,6 +356,8 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         if service and name != service:
             continue
         if config["port"] == 443:
+            circuit_state = circuit_states.get(f"{name}:certificate", circuit_states.get(name, "CLOSED"))
+            limiter.wait_for_token(half_open=circuit_state.upper() == "HALF_OPEN")
             cert_status, cert_detail, days_left = check_certificate_expiry(config["host"])
             results["services"][name]["certificate"] = {
                 "status": cert_status,
@@ -270,6 +368,7 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
                 all_ok = False
 
     results["overall_status"] = "OK" if all_ok else "DEGRADED"
+    results["rate_limiter"] = limiter.stats()
 
     return results
 
@@ -280,6 +379,12 @@ def print_health_report(results: Dict[str, Any]):
     print(f"  Host: {results['hostname']}")
     print(f"  Time: {results['timestamp']}")
     print(f"  Overall: {results['overall_status']}")
+    rate_stats = results.get("rate_limiter", {})
+    if rate_stats:
+        print(
+            f"  Probe rate: {rate_stats.get('current_rate')} probes/s "
+            f"(throttled: {rate_stats.get('throttled_requests')})"
+        )
     print(f"{'='*60}")
 
     for category, items in [("Services", results["services"]),
@@ -307,6 +412,16 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument(
+        "--timeout",
+        help="Override probe timeout for all services, or use comma-separated service=value pairs",
+    )
+    parser.add_argument(
+        "--probe-rate",
+        type=float,
+        default=0.0,
+        help="Maximum probes per second across all health checks; 0 disables throttling",
+    )
     return parser.parse_args()
 
 
@@ -317,7 +432,7 @@ def main():
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(args.service, args.json, args.timeout, args.probe_rate)
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +441,7 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(args.service, args.json, args.timeout, args.probe_rate)
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
